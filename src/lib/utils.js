@@ -12,6 +12,11 @@ import fromWei from '../filters/FromWei';
 
 const MINIMUM_DISPLAY_GWEI = 10000000;
 
+/**
+ * Format gas price for display
+ * @param {number|string|null|undefined} gasPrice - Gas price value
+ * @returns {string|null} Formatted gas price string or null
+ */
 export const displayGasPrice = (gasPrice) => {
     if (gasPrice === null || gasPrice === undefined)
         return null;
@@ -23,6 +28,11 @@ export const displayGasPrice = (gasPrice) => {
         return fromWei(gasPrice, 'gwei', 'gwei', false, 2);
 };
 
+/**
+ * Format percentage value for display
+ * @param {number|null|undefined} value - Percentage value
+ * @returns {string|null} Formatted percentage string or null
+ */
 export const displayPercentage = (value) => {
     if (value === null || value === undefined)
         return null;
@@ -34,6 +44,12 @@ export const displayPercentage = (value) => {
         return `${(value * 100).toFixed(2)}%`;
 };
 
+/**
+ * Get best contrasting color based on background
+ * @param {string} background - Background color in hex format
+ * @param {Object} themeColors - Theme color mappings
+ * @returns {string|null} Best contrasting color name or null
+ */
 export const getBestContrastingColor = (background, themeColors) => {
     const colorValues = {
         [themeColors.primary]: 'primary',
@@ -104,6 +120,11 @@ export const getBestContrastingColor = (background, themeColors) => {
 };
 
 // https://stackoverflow.com/a/22885197/1373409
+/**
+ * Get number of significant digits in a number
+ * @param {number} n - Input number
+ * @returns {number} Number of significant digits
+ */
 export const getSignificantDigitCount = (n) => {
     const log10 = Math.log(10);
     n = Math.abs(String(n).replace(".", "")); //remove decimal and make positive
@@ -113,6 +134,12 @@ export const getSignificantDigitCount = (n) => {
     return Math.floor(Math.log(n) / log10) + 1; //get number of digits
 }
 
+/**
+ * Create a debounced function
+ * @param {Function} func - Function to debounce
+ * @param {number} wait - Wait time in milliseconds
+ * @returns {Function} Debounced function
+ */
 export const debounce = (func, wait) => {
     let debounceTimeout;
     return (...args) => {
@@ -121,16 +148,32 @@ export const debounce = (func, wait) => {
     };
 };
 
+/**
+ * Validate Ethereum address format
+ * @param {string} val - Address to validate
+ * @returns {RegExpMatchArray|null} Match result or null
+ */
 export const isValidEthAddress = (val) => {
     return val.match(/(\b0x[A-Fa-f0-9]{40}\b)/g);
 };
 
+/**
+ * Convert BigNumber to significant digits
+ * @param {string|number} num - BigNumber value
+ * @param {number} digits - Number of significant digits (default: 4)
+ * @returns {number} Formatted number
+ */
 export const BNtoSignificantDigits = (num, digits = 4) => {
     if (!num) return num;
 
     return parseFloat((+ethers.utils.formatEther(num)).toPrecision(digits));
 };
 
+/**
+ * Convert scientific notation to regular number
+ * @param {number|string} num - Number in scientific notation
+ * @returns {string} Regular number string
+ */
 export const eToNumber = (num) => {
     let sign = "";
     (num += "").charAt(0) === "-" && (num = num.substring(1), sign = "-");
@@ -160,7 +203,11 @@ export const eToNumber = (num) => {
     return sign + n;
 };
 
-
+/**
+ * Validate URL format
+ * @param {string} url - URL to validate
+ * @returns {boolean} True if valid URL
+ */
 export const isUrlValid = (url) => {
     try {
         new URL(url);
@@ -170,11 +217,22 @@ export const isUrlValid = (url) => {
     }
 };
 
+/**
+ * Convert hex color to RGBA
+ * @param {string} hex - Hex color value
+ * @param {number} alpha - Alpha value (default: 1)
+ * @returns {string} RGBA color string
+ */
 export const hex2rgba = (hex, alpha = 1) => {
     const [r, g, b] = hex.match(/\w\w/g).map(x => parseInt(x, 16));
     return `rgba(${r},${g},${b},${alpha})`;
 };
 
+/**
+ * Get effective gas price from transaction
+ * @param {Object} transaction - Transaction object
+ * @returns {string|null} Gas price value or null
+ */
 export const getGasPriceFromTransaction= (transaction) => {
     if (!transaction || !transaction.receipt)
         return null;
@@ -196,6 +254,11 @@ export const getGasPriceFromTransaction= (transaction) => {
     return amountInt;
 };
 
+/**
+ * Shorten RPC URL for display
+ * @param {string} rpc - RPC URL
+ * @returns {string} Shortened URL
+ */
 export const shortRpcUrl = (rpc) => {
     try {
         const url = new URL(rpc);
@@ -205,6 +268,11 @@ export const shortRpcUrl = (rpc) => {
     }
 }
 
+/**
+ * Sanitize object by removing null values and normalizing addresses
+ * @param {Object} obj - Object to sanitize
+ * @returns {Object} Sanitized object
+ */
 export const sanitize = function(obj) {
     return Object.fromEntries(
         Object.entries(obj)
@@ -218,6 +286,11 @@ export const sanitize = function(obj) {
     );
 };
 
+/**
+ * Get Web3 provider based on RPC URL
+ * @param {string} rpcServer - RPC server URL
+ * @returns {Object} Web3 provider
+ */
 export const getProvider = function(rpcServer) {
     if (rpcServer.startsWith('ws://') || rpcServer.startsWith('wss://')) {
         return new Web3.providers.WebsocketProvider(rpcServer);
@@ -227,6 +300,12 @@ export const getProvider = function(rpcServer) {
     }
 };
 
+/**
+ * Process method call parameter based on input type
+ * @param {string} param - Parameter value
+ * @param {string} inputType - Input type
+ * @returns {any} Processed parameter value
+ */
 export const processMethodCallParam = function(param, inputType) {
     if (inputType == 'bool')
         if (param === 'true')
@@ -244,6 +323,11 @@ export const processMethodCallParam = function(param, inputType) {
     return param;
 };
 
+/**
+ * Format contract pattern for display
+ * @param {string} pattern - Contract pattern
+ * @returns {string} Formatted pattern
+ */
 export const formatContractPattern = function(pattern) {
     switch (pattern) {
         case 'erc20':
@@ -259,6 +343,12 @@ export const formatContractPattern = function(pattern) {
     }
 };
 
+/**
+ * Format number with proper formatting
+ * @param {string|number} number - Number to format
+ * @param {Object} options - Formatting options
+ * @returns {string} Formatted number
+ */
 export const formatNumber = (number, options = {}) => {
     if (number === undefined || number === null) return;
     const formatUnits = ethers.utils.formatUnits;

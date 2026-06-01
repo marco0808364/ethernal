@@ -9,6 +9,14 @@
 </template>
 
 <script setup>
+/**
+ * ThemeToggle Component
+ * @description A theme toggle button that switches between light and dark modes
+ * @component ThemeToggle
+ * @vue-prop {boolean} [isDarkMode=false] - Current theme state
+ * @vue-event {void} toggleTheme - Emitted when theme is toggled
+ */
+
 import { ref, onMounted, onBeforeUnmount } from 'vue';
 import { useTheme } from 'vuetify';
 
@@ -16,7 +24,11 @@ const theme = useTheme();
 const isDarkMode = ref(false);
 const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
 
-// Initialize theme state
+/**
+ * Initialize theme state from localStorage or system preference
+ * @function initializeTheme
+ * @returns {void}
+ */
 const initializeTheme = () => {
   /** @type {('light'|'dark'|null)} */
   const savedTheme = localStorage.getItem('theme');
@@ -33,7 +45,11 @@ const initializeTheme = () => {
   applyTheme();
 };
 
-// Apply theme changes
+/**
+ * Apply theme changes to the application
+ * @function applyTheme
+ * @returns {void}
+ */
 const applyTheme = () => {
   const themeName = isDarkMode.value ? 'dark' : 'light';
   theme.global.name.value = themeName;
@@ -47,13 +63,22 @@ const applyTheme = () => {
   }
 };
 
-// Toggle theme handler
+/**
+ * Toggle theme handler - switches between light and dark modes
+ * @function toggleTheme
+ * @returns {void}
+ */
 const toggleTheme = () => {
   isDarkMode.value = !isDarkMode.value;
   applyTheme();
 };
 
-// System theme preference handler
+/**
+ * System theme preference handler - updates theme when system preference changes
+ * @function updateThemeFromSystem
+ * @param {MediaQueryListEvent} e - Media query event
+ * @returns {void}
+ */
 const updateThemeFromSystem = (e) => {
   // Only apply system preference if user hasn't explicitly chosen a theme
   if (!localStorage.getItem('theme')) {
