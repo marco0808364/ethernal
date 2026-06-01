@@ -1,0 +1,88 @@
+const { Queue } = require('bullmq');
+const connection = require('./lib/redis');
+const priorities = require('./workers/priorities');
+
+const queues = {};
+priorities['high'].forEach(jobName => {
+    queues[jobName] = new Queue(jobName, {
+        defaultJobOptions: {
+            attempts: 15,
+            stackTraceLimit: 3,
+            removeOnComplete: {
+                count: 100,
+                age: 4 * 60
+            },
+            removeOnFail: {
+                count: 50,
+                age: 4 * 60
+            },
+            timeout: 30000,
+            backoff: {
+                type: 'fixed',
+                delay: 30000
+            },
+        },
+        stalledInterval: 29000,
+        maxStalledCount: 5,
+        connection,
+    });
+});
+
+priorities['medium'].forEach(jobName => {
+    queues[jobName] = new Queue(jobName, {
+        defaultJobOptions: {
+            attempts: 40,
+            stackTraceLimit: 3,
+            removeOnComplete: 20,
+            removeOnFail: 20,
+            timeout: 30000,
+            backoff: {
+                type: 'exponential',
+                delay: 1000
+            }
+        },
+        connection
+    });
+});
+
+priorities['low'].forEach(jobName => {
+    queues[jobName] = new Queue(jobName, {
+        defaultJobOptions: {
+            attempts: 10,
+            stackTraceLimit: 3,
+            removeOnComplete: 10,
+            removeOnFail: 10,
+            timeout: 30000,
+            backoff: {
+                type: 'exponential',
+                delay: 1000
+            }
+        },
+        connection
+    });
+});
+
+queues['processHistoricalBlocks'] = new Queue('processHistoricalBlocks', {
+    defaultJobOptions: {
+        attempts: 5,
+        stackTraceLimit: 3,
+        removeOnComplete: {
+            count: 100,
+            age: 4 * 60
+        },
+        removeOnFail: {
+            count: 10,
+            age: 4 * 60
+        },
+        timeout: 30000,
+        backoff: {
+            type: 'fixed',
+            delay: 30000
+        },
+    },
+    stalledInterval: 29000,
+    maxStalledCount: 5,
+    connection,
+});
+
+module.exports = queues;

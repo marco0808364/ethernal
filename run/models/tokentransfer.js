@@ -1,0 +1,374 @@
+/**
+ * @fileoverview TokenTransfer model - represents ERC20/ERC721/ERC1155 token transfers.
+ * Tracks token movements extracted from transaction logs.
+ *
+ * @module models/TokenTransfer
+ *
+ * @property {number} id - Primary key
+ * @property {number} workspaceId - Foreign key to workspace
+ * @property {number} transactionId - Foreign key to transaction
+ * @property {string} src - Source address
+ * @property {string} dst - Destination address
+ * @property {string} token - Token contract address
+ * @property {string} amount - Transfer amount
+ * @property {string} tokenId - NFT token ID (for ERC721/1155)
+ * @property {boolean} isReward - Whether this is a validator reward
+ */
+
+'use strict';
+const {
+  Model,
+  Sequelize
+} = require('sequelize');
+const Op = Sequelize.Op
+const ethers = require('ethers');
+const { trigger } = require('../lib/pusher');
+const { enqueue } = require('../lib/queue');
+const { sanitize } = require('../lib/utils');
+const logger = require('../lib/logger');
+
+module.exports = (sequelize, DataTypes) => {
+  class TokenTransfer extends Model {
+    /**
+     * Helper method for defining associations.
+     * This method is not a part of Sequelize lifecycle.
+     * The `models/index` file will call this method automatically.
+     */
+    static associate(models) {
+      TokenTransfer.belongsTo(models.Transaction, { foreignKey: 'transactionId', as: 'transaction' });
+      TokenTransfer.belongsTo(models.Workspace, { foreignKey: 'workspaceId', as: 'workspace' });
+      TokenTransfer.hasOne(models.Contract, {
+          sourceKey: 'token',
+          foreignKey: 'address',
+          as: 'contract',
+          scope: {
+            [Op.and]: sequelize.where(sequelize.col("TokenTransfer.workspaceId"),
+                Op.eq,
+                sequelize.col("contract.workspaceId")
+            ),
+          },
+          constraints: false
+      });
+      TokenTransfer.hasOne(models.TokenTransferEvent, { foreignKey: 'tokenTransferId', as: 'event' });
+      TokenTransfer.hasMany(models.TokenBalanceChange, { foreignKey: 'tokenTransferId', as: 'tokenBalanceChanges' });
+    }
+
+    async safeDestroy(transaction) {
+        const tokenBalanceChanges = await this.getTokenBalanceChanges({ transaction });
+        for (let i = 0; i < tokenBalanceChanges.length; i++)
+            await tokenBalanceChanges[i].safeDestroy(transaction);
+
+        const event = await this.getEvent({ transaction });
+        if (event)
+            await event.destroy({ transaction });
+
+        return this.destroy({ transaction });
+    }
+
+    getContract(options = {}) {
+        return sequelize.models.Contract.findOne({
+            where: {
+                workspaceId: this.workspaceId,
+                address: this.token
+            },
+            ...options
+        });
+    }
+
+    async insertAnalyticEvent(sequelizeTransaction) {
+        const transaction = await this.getTransaction({ transaction: sequelizeTransaction });
+        const contract = await this.getContract({ transaction: sequelizeTransaction });
+
+        try {
+            return await sequelize.models.TokenTransferEvent.create({
+                workspaceId: this.workspaceId,
+                tokenTransferId: this.id,
+                blockNumber: transaction.blockNumber,
+                timestamp: transaction.timestamp,
+                amount: ethers.BigNumber.from(this.amount).toString(),
+                token: this.token,
+                tokenType: contract ? contract.patterns[0] : null,
+                src: this.src,
+                dst: this.dst
+            }, { transaction: sequelizeTransaction, returning: false });
+        } catch (error) {
+            // Log but don't fail — this is analytical data.
+            // Note: a deadlock (40P01) would abort the PG transaction state, causing
+            // the outer COMMIT to fail. The FK drop in migration 20260402000001
+            // prevents that; this catch handles non-deadlock errors (unique constraint, etc.)
+            logger.error(`Error creating token transfer event: ${error.message}`);
+            return null;
+        }
+    }
+
+    async safeCreateBalanceChange(balanceChange) {
+        if (!balanceChange || !balanceChange.address || balanceChange.diff === '0') {
+            return null; // Skip creation for invalid or zero balance changes
+        }
+
+        return sequelize.transaction(async (transaction) => {
+            try {
+                const [tokenBalanceChange] = await sequelize.models.TokenBalanceChange.bulkCreate([
+                    sanitize({
+                        transactionId: this.transactionId,
+                        workspaceId: this.workspaceId,
+                        tokenTransferId: this.id,
+                        token: this.token,
+                        address: balanceChange.address,
+                        currentBalance: balanceChange.currentBalance,
+                        previousBalance: balanceChange.previousBalance,
+                        diff: balanceChange.diff
+                    })
+                ], {
+                    ignoreDuplicates: true,
+                    returning: true,
+                    transaction
+                });
+
+                if (tokenBalanceChange && tokenBalanceChange.id) {
+                    await tokenBalanceChange.insertAnalyticEvent(transaction);
+                }
+
+                return tokenBalanceChange;
+            } catch (error) {
+                // Log the error but don't fail the entire job
+                logger.error('Error creating balance change:', {
+                    error: error.message,
+                    tokenTransferId: this.id,
+                    address: balanceChange.address,
+                    token: this.token
+                });
+                throw error; // Re-throw to rollback transaction
+            }
+        });
+    }
+
+    async safeCreateBalanceChanges(balanceChanges) {
+        if (!balanceChanges || !Array.isArray(balanceChanges) || balanceChanges.length === 0) {
+            return []; // Return empty array for invalid input
+        }
+
+        // Check if TokenTransfer still exists (guard against race conditions)
+        if (!this.id) {
+            console.warn('TokenTransfer has no ID, cannot create balance changes');
+            return [];
+        }
+
+        // Filter out invalid or zero balance changes
+        const validBalanceChanges = balanceChanges.filter(change =>
+            change && change.address && change.diff !== '0'
+        );
+
+        if (validBalanceChanges.length === 0) {
+            return []; // No valid changes to process
+        }
+
+        return sequelize.transaction(async (transaction) => {
+            try {
+                // Prepare all balance change records
+                const balanceChangeRecords = validBalanceChanges.map(change => 
+                    sanitize({
+                        transactionId: this.transactionId,
+                        workspaceId: this.workspaceId,
+                        tokenTransferId: this.id,
+                        token: this.token,
+                        address: change.address,
+                        currentBalance: change.currentBalance,
+                        previousBalance: change.previousBalance,
+                        diff: change.diff
+                    })
+                );
+
+                // Bulk create all balance changes at once
+                let createdBalanceChanges;
+                try {
+                    createdBalanceChanges = await sequelize.models.TokenBalanceChange.bulkCreate(
+                        balanceChangeRecords,
+                        {
+                            ignoreDuplicates: true,
+                            returning: true,
+                            transaction
+                        }
+                    );
+                } catch (error) {
+                    // Handle foreign key constraint violation (TokenTransfer deleted during processing)
+                    if (error.name === 'SequelizeForeignKeyConstraintError' &&
+                        error.fields && error.fields.includes('tokenTransferId')) {
+                        console.warn(`TokenTransfer ${this.id} was deleted during balance change processing, skipping balance changes`);
+                        return [];
+                    }
+                    throw error; // Re-throw other errors
+                }
+
+                // Create analytic events for all created balance changes
+                const analyticEventPromises = createdBalanceChanges
+                    .filter(balanceChange => balanceChange && balanceChange.id)
+                    .map(balanceChange => balanceChange.insertAnalyticEvent(transaction));
+
+                // Wait for all analytic events to be created
+                await Promise.all(analyticEventPromises);
+
+                return createdBalanceChanges;
+            } catch (error) {
+                // Log the error but don't fail the entire job
+                logger.error('Error creating balance changes:', {
+                    error: error.message,
+                    tokenTransferId: this.id,
+                    token: this.token,
+                    balanceChangesCount: validBalanceChanges.length
+                });
+                throw error; // Re-throw to rollback transaction
+            }
+        });
+    }
+
+    async afterCreate(options) {
+        const transaction = await this.getTransaction({
+            attributes: ['blockNumber', 'hash'],
+            include: [
+                {
+                    model: sequelize.models.TokenTransfer,
+                    attributes: ['id', 'src', 'dst', 'token'],
+                    as: 'tokenTransfers',
+                },
+                {
+                    model: sequelize.models.Workspace,
+                    attributes: ['id', 'public', 'rpcServer', 'name', 'processNativeTokenTransfers'],
+                    as: 'workspace',
+                    include: {
+                        model: sequelize.models.User,
+                        attributes: ['firebaseUserId'],
+                        as: 'user'
+                    }
+                }
+            ]
+        });
+
+        return this.afterCreateWithTransaction(transaction, options);
+    }
+
+    async afterCreateWithTransaction(transaction, options) {
+        if (transaction.workspace.public) {
+            options.transaction.afterCommit(() => {
+                // Process ERC-20/721/1155 tokens always, native tokens only if flag is enabled
+                const isNativeToken = this.token === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+                const shouldProcess = !isNativeToken || transaction.workspace.processNativeTokenTransfers;
+
+                if (shouldProcess) {
+                    return enqueue('processTokenTransfer',
+                        `processTokenTransfer-${this.workspaceId}-${this.token}-${this.id}`, {
+                            tokenTransferId: this.id
+                        }
+                    );
+                }
+            });
+
+            if (this.tokenId)
+                await enqueue('reloadErc721Token',
+                    `reloadErc721Token-${this.workspaceId}-${this.token}-${this.tokenId}`, {
+                        workspaceId: this.workspaceId,
+                        address: this.token,
+                        tokenId: this.tokenId
+                    }
+                );
+        }
+
+        if (!transaction.workspace.public)
+            trigger(`private-processableTransactions;workspace=${transaction.workspace.id}`, 'new', transaction.toJSON());
+    }
+  }
+  TokenTransfer.init({
+    amount: DataTypes.STRING,
+    dst: {
+        type: DataTypes.STRING,
+        set(value) {
+            this.setDataValue('dst', value.toLowerCase());
+        }
+    },
+    src: {
+        type: DataTypes.STRING,
+        set(value) {
+            this.setDataValue('src', value.toLowerCase());
+        }
+    },
+    token: {
+        type: DataTypes.STRING,
+        set(value) {
+            this.setDataValue('token', value.toLowerCase());
+        }
+    },
+    tokenId: {
+        type: DataTypes.INTEGER,
+        set(value) {
+            this.setDataValue('tokenId', parseInt(value))
+        }
+    },
+    transactionId: DataTypes.INTEGER,
+    transactionLogId: DataTypes.INTEGER,
+    workspaceId: DataTypes.INTEGER,
+    isReward: DataTypes.BOOLEAN
+  }, {
+    hooks: {
+        afterBulkCreate(tokenTransfers, options) {
+            // Optimize N+1 query: group by transactionId and fetch each transaction once
+            const transactionGroups = new Map();
+
+            // Group token transfers by transaction ID
+            for (const tokenTransfer of tokenTransfers) {
+                const transactionId = tokenTransfer.transactionId;
+                if (!transactionGroups.has(transactionId)) {
+                    transactionGroups.set(transactionId, []);
+                }
+                transactionGroups.get(transactionId).push(tokenTransfer);
+            }
+
+            // Fetch each unique transaction with includes
+            const transactionIds = Array.from(transactionGroups.keys());
+            const transactionsPromise = sequelize.models.Transaction.findAll({
+                where: { id: transactionIds },
+                attributes: ['id', 'blockNumber', 'hash'],
+                include: [
+                    {
+                        model: sequelize.models.TokenTransfer,
+                        attributes: ['id', 'src', 'dst', 'token'],
+                        as: 'tokenTransfers'
+                    },
+                    {
+                        model: sequelize.models.Workspace,
+                        attributes: ['id', 'public', 'rpcServer', 'name', 'processNativeTokenTransfers'],
+                        as: 'workspace',
+                        include: {
+                            model: sequelize.models.User,
+                            attributes: ['firebaseUserId'],
+                            as: 'user'
+                        }
+                    }
+                ]
+            });
+
+            return transactionsPromise.then(transactions => {
+                const transactionMap = new Map(transactions.map(t => [t.id, t]));
+
+                // Process each token transfer with its cached transaction
+                const promises = [];
+                for (const [transactionId, groupTokenTransfers] of transactionGroups) {
+                    const transaction = transactionMap.get(transactionId);
+                    if (transaction) {
+                        for (const tokenTransfer of groupTokenTransfers) {
+                            promises.push(tokenTransfer.afterCreateWithTransaction(transaction, options));
+                        }
+                    }
+                }
+                return Promise.all(promises);
+            });
+        },
+        afterCreate(tokenTransfer, options) {
+            return tokenTransfer.afterCreate(options);
+        }
+    },
+    sequelize,
+    modelName: 'TokenTransfer',
+    tableName: 'token_transfers'
+  });
+  return TokenTransfer;
+};

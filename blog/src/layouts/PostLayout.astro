@@ -1,0 +1,379 @@
+---
+/**
+ * @fileoverview Article page layout with hero, metadata, content, and related posts.
+ * @component PostLayout
+ * @prop {object} post - The blog post entry from the collection
+ */
+import BaseLayout from './BaseLayout.astro';
+import { getCollection } from 'astro:content';
+
+interface Props {
+  post: {
+    id: string;
+    data: {
+      title: string;
+      date: Date;
+      description: string;
+      tags: string[];
+      image?: string;
+      ogImage?: string;
+      readingTime?: number;
+    };
+  };
+}
+
+const { post } = Astro.props;
+const { title, date, description, tags, image, ogImage, readingTime } = post.data;
+
+const formattedDate = date.toLocaleDateString('en-US', {
+  year: 'numeric',
+  month: 'long',
+  day: 'numeric',
+});
+
+const tag = tags[0] || 'Article';
+
+// Get related posts (same tag, excluding current)
+const allPosts = await getCollection('blog');
+const relatedPosts = allPosts
+  .filter(p => p.id !== post.id && p.data.tags.some(t => tags.includes(t)))
+  .sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf())
+  .slice(0, 3);
+
+// Topic-aware CTA: pick destination + headline based on article tags.
+// Order matters — first match wins so more specific tags should come first.
+const appUrl = import.meta.env.PUBLIC_APP_URL || 'https://app.tryethernal.com';
+const tagSet = new Set(tags.map(t => t.toLowerCase()));
+function has(...keys) { return keys.some(k => tagSet.has(k.toLowerCase())); }
+
+let ctaVariant;
+if (has('Comparison') || /alternative|vs |best/i.test(title)) {
+  ctaVariant = {
+    headline: 'See how Ethernal compares',
+    body: 'Side-by-side with Etherscan, Blockscout, and Routescan — what they miss, what we add.',
+    primary: { label: 'Compare plans', href: 'https://tryethernal.com/pricing?utm_source=blog&utm_medium=cta&utm_campaign=' + post.id },
+    secondary: { label: 'Etherscan alternative', href: 'https://tryethernal.com/etherscan-alternative?utm_source=blog&utm_medium=cta&utm_campaign=' + post.id }
+  };
+} else if (has('Security', 'Auditing', 'MEV', 'DeFi')) {
+  ctaVariant = {
+    headline: 'Trace any transaction in your explorer',
+    body: 'Decoded calls, state diffs, internal transfers. Free for any EVM chain — connect your RPC and go.',
+    primary: { label: 'Get a free explorer', href: `${appUrl}/auth?flow=public&utm_source=blog&utm_medium=cta&utm_campaign=${post.id}` },
+    secondary: { label: 'See tracing in action', href: 'https://tryethernal.com/blog/transaction-tracing-with-ethernal?utm_source=blog&utm_medium=cta&utm_campaign=' + post.id }
+  };
+} else if (has('L2', 'Infrastructure', 'Blobs')) {
+  ctaVariant = {
+    headline: 'Run a block explorer for your L2',
+    body: 'Custom branding, custom domain, full historical sync. Used by appchains and rollups in production.',
+    primary: { label: 'Get started free', href: `${appUrl}/auth?flow=public&utm_source=blog&utm_medium=cta&utm_campaign=${post.id}` },
+    secondary: { label: 'View pricing', href: 'https://tryethernal.com/pricing?utm_source=blog&utm_medium=cta&utm_campaign=' + post.id }
+  };
+} else if (has('Ethernal', 'Developer Tools')) {
+  ctaVariant = {
+    headline: 'Try Ethernal on your chain',
+    body: 'Connect any EVM RPC and get a fully working explorer in under 5 minutes. Free tier, no credit card.',
+    primary: { label: 'Get started free', href: `${appUrl}/auth?flow=public&utm_source=blog&utm_medium=cta&utm_campaign=${post.id}` },
+    secondary: { label: 'See features', href: 'https://tryethernal.com/features?utm_source=blog&utm_medium=cta&utm_campaign=' + post.id }
+  };
+} else if (has('EVM', 'Smart Contracts', 'Ethereum', 'Account Abstraction', 'ZK', 'NFT', 'Payments', 'AI Agents', 'State', 'Privacy')) {
+  ctaVariant = {
+    headline: 'Need an explorer that understands modern EVM?',
+    body: 'Decoded transactions, verified contracts, token transfers, traces — for any EVM chain you point it at.',
+    primary: { label: 'Try it free', href: `${appUrl}/auth?flow=public&utm_source=blog&utm_medium=cta&utm_campaign=${post.id}` },
+    secondary: { label: 'Browse a live explorer', href: 'https://tryethernal.com/blog/public-explorers?utm_source=blog&utm_medium=cta&utm_campaign=' + post.id }
+  };
+} else {
+  ctaVariant = {
+    headline: 'Need a block explorer for your chain?',
+    body: 'Connect your RPC and get a fully working explorer in under 5 minutes.',
+    primary: { label: 'Get started free', href: `${appUrl}/auth?flow=public&utm_source=blog&utm_medium=cta&utm_campaign=${post.id}` },
+    secondary: null
+  };
+}
+---
+
+<BaseLayout title={title} description={description} image={image} ogImage={ogImage} plainBg ogType="article">
+  <!-- Structured Data: BlogPosting -->
+  <script type="application/ld+json" set:html={JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "BlogPosting",
+    "headline": title,
+    "description": description,
+    "url": `https://tryethernal.com/blog/${post.id}`,
+    "datePublished": date.toISOString().split('T')[0],
+    "dateModified": date.toISOString().split('T')[0],
+    "image": (ogImage || image) ? ((ogImage || image).startsWith('http') ? (ogImage || image) : `https://tryethernal.com${ogImage || image}`) : undefined,
+    "author": {
+      "@type": "Person",
+      "name": "Antoine",
+      "url": "https://tryethernal.com",
+      "sameAs": [
+        "https://twitter.com/adechevigne",
+        "https://github.com/antoinedc"
+      ]
+    },
+    "publisher": {
+      "@type": "Organization",
+      "name": "Ethernal",
+      "url": "https://tryethernal.com",
+      "logo": { "@type": "ImageObject", "url": "https://tryethernal.com/favicon.ico" }
+    },
+    "keywords": tags.join(", "),
+    "wordCount": readingTime ? readingTime * 250 : undefined,
+    "mainEntityOfPage": {
+      "@type": "WebPage",
+      "@id": `https://tryethernal.com/blog/${post.id}`
+    }
+  })} />
+  <!-- Structured Data: BreadcrumbList -->
+  <script type="application/ld+json" set:html={JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://tryethernal.com" },
+      { "@type": "ListItem", "position": 2, "name": "Blog", "item": "https://tryethernal.com/blog" },
+      { "@type": "ListItem", "position": 3, "name": title, "item": `https://tryethernal.com/blog/${post.id}` }
+    ]
+  })} />
+
+  <article class="max-w-4xl mx-auto px-4 sm:px-6">
+    <!-- Back link -->
+    <div class="pt-8 pb-6">
+      <a href="/blog" class="text-sm text-text-secondary hover:text-primary transition-colors">
+        &larr; Back to Blog
+      </a>
+    </div>
+
+    <!-- Hero image / generated cover -->
+    {image ? (
+      <div class="rounded-xl overflow-hidden mb-8 border border-border-subtle">
+        <img src={image} alt={`Cover image for ${title}`} width="1200" height="514" class="w-full h-auto max-h-96 object-cover" />
+      </div>
+    ) : (
+      <div class="rounded-xl overflow-hidden mb-8 relative aspect-[21/9] bg-gradient-to-br from-sky-600/80 via-blue-700/70 to-indigo-800/80">
+        <div class="absolute inset-0 opacity-[0.15]">
+          <div class="absolute top-6 right-12 w-40 h-40 border border-white/40 rounded-full"></div>
+          <div class="absolute bottom-8 left-8 w-24 h-24 border border-white/30 rounded-lg rotate-45"></div>
+          <div class="absolute top-1/2 left-1/3 w-20 h-20 border border-white/20 rounded-full"></div>
+          <div class="absolute top-10 left-16 w-32 h-1 bg-white/20 rounded"></div>
+        </div>
+        <div class="absolute inset-0 flex items-end p-8">
+          <p class="text-white font-heading font-bold text-2xl sm:text-3xl leading-snug drop-shadow-md max-w-2xl">
+            {title}
+          </p>
+        </div>
+      </div>
+    )}
+
+    <!-- Header -->
+    <header class="mb-10">
+      <h1 class="font-heading text-3xl sm:text-4xl lg:text-[2.75rem] font-bold text-text-primary leading-tight mb-4">
+        {title}
+      </h1>
+      <div class="flex flex-wrap items-center gap-3 text-sm text-text-muted">
+        <span class="text-xs font-medium text-primary bg-primary/10 px-2.5 py-1 rounded">{tag}</span>
+        <span>by Antoine</span>
+        <span>&middot; {formattedDate}</span>
+        {readingTime && <span>&middot; {readingTime} min read</span>}
+      </div>
+    </header>
+
+    <!-- Article body -->
+    <div class="prose prose-lg max-w-none mb-12" id="article-body">
+      <slot />
+    </div>
+
+    <!-- End-of-article CTA (always rendered, topic-aware) -->
+    <section class="not-prose mb-16">
+      <div class="rounded-2xl border border-primary/20 bg-gradient-to-br from-primary/10 via-primary/5 to-transparent p-8 sm:p-10">
+        <h2 class="font-heading text-2xl sm:text-3xl font-semibold text-text-primary mb-3">{ctaVariant.headline}</h2>
+        <p class="text-text-secondary text-base mb-6 max-w-2xl">{ctaVariant.body}</p>
+        <div class="flex flex-col sm:flex-row gap-3">
+          <a href={ctaVariant.primary.href.replace('utm_medium=cta', 'utm_medium=end_article_cta')}
+             class="end-cta-primary inline-flex items-center gap-2 px-6 py-3 rounded-full font-semibold text-sm tracking-wide transition-all duration-200 hover:opacity-90 hover:shadow-lg hover:shadow-primary/30"
+             style="background: linear-gradient(90deg, #2670A5, #3D95CE); color: #ffffff;">
+            {ctaVariant.primary.label}
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+          </a>
+          {ctaVariant.secondary && (
+            <a href={ctaVariant.secondary.href.replace('utm_medium=cta', 'utm_medium=end_article_cta')}
+               class="end-cta-secondary inline-flex items-center gap-2 px-6 py-3 rounded-full font-semibold text-sm tracking-wide transition-all duration-200 border border-border-subtle text-text-primary hover:border-primary/40 hover:bg-primary/5">
+              {ctaVariant.secondary.label}
+            </a>
+          )}
+        </div>
+      </div>
+    </section>
+  </article>
+
+  <!-- Related posts -->
+  {relatedPosts.length > 0 && (
+    <section class="max-w-6xl mx-auto px-4 sm:px-6 pb-6">
+      <div class="border-t border-border-subtle pt-12">
+        <h2 class="font-heading text-2xl font-semibold text-text-primary mb-8">Related Articles</h2>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {relatedPosts.map(rp => {
+            const rpTag = rp.data.tags[0] || 'Article';
+            return (
+              <a href={`/blog/${rp.id}`} class="blog-card group">
+                {rp.data.image ? (
+                  <div class="aspect-[16/9] overflow-hidden">
+                    <img src={rp.data.image} alt={`Cover image for ${rp.data.title}`}
+                         width="800" height="450" loading="lazy"
+                         class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
+                  </div>
+                ) : (
+                  <div class="aspect-[16/9] relative bg-gradient-to-br from-sky-600/80 via-blue-700/70 to-indigo-800/80 overflow-hidden">
+                    <div class="absolute inset-0 opacity-[0.15]">
+                      <div class="absolute top-4 right-8 w-24 h-24 border border-white/40 rounded-full"></div>
+                      <div class="absolute bottom-4 left-4 w-14 h-14 border border-white/30 rounded-lg rotate-45"></div>
+                    </div>
+                    <div class="absolute inset-0 flex flex-col justify-end p-4">
+                      <span class="text-[9px] uppercase tracking-widest text-white/60 font-medium mb-1">{rpTag}</span>
+                      <p class="text-white font-heading font-semibold text-sm leading-snug line-clamp-2 drop-shadow-md">
+                        {rp.data.title}
+                      </p>
+                    </div>
+                  </div>
+                )}
+                <div class="p-4">
+                  <span class="text-xs text-text-muted">{rp.data.date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                  <h3 class="font-heading text-base font-semibold text-text-primary mt-1 line-clamp-2 group-hover:text-primary transition-colors">
+                    {rp.data.title}
+                  </h3>
+                </div>
+              </a>
+            );
+          })}
+        </div>
+      </div>
+    </section>
+  )}
+
+  <!-- Newsletter signup -->
+  <section class="max-w-4xl mx-auto px-4 sm:px-6 pb-8">
+    <div class="border-t border-border-subtle pt-10 text-center">
+      <h2 class="font-heading text-xl sm:text-2xl font-semibold text-text-primary mb-2">Get new articles in your inbox</h2>
+      <p class="text-text-secondary text-sm mb-5">Deep dives on EVM internals, smart contract security, and chain infrastructure. No spam.</p>
+      <form id="newsletter-form" class="flex flex-col sm:flex-row gap-3 max-w-md mx-auto">
+        <input type="email" name="email" required placeholder="you@example.com"
+          class="flex-1 px-4 py-2.5 rounded-lg bg-bg-secondary border border-border-subtle text-text-primary text-sm placeholder:text-text-muted focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary" />
+        <button type="submit"
+          class="px-5 py-2.5 rounded-lg text-white font-semibold text-sm transition-all duration-200 hover:opacity-90 whitespace-nowrap"
+          style="background: linear-gradient(90deg, #3D95CE, #5DAAE0);">
+          Subscribe
+        </button>
+      </form>
+      <p id="newsletter-msg" class="text-sm mt-3 hidden"></p>
+    </div>
+  </section>
+
+  <!-- Mid-article CTA (injected via JS after ~40% of content) — topic-aware -->
+  <template id="mid-article-cta">
+    <div class="not-prose my-10 rounded-xl border border-primary/20 bg-primary/5 p-6 sm:p-8 text-center">
+      <p class="font-heading text-lg sm:text-xl font-semibold text-text-primary mb-2">{ctaVariant.headline}</p>
+      <p class="text-text-secondary text-sm mb-4">{ctaVariant.body}</p>
+      <a href={ctaVariant.primary.href.replace('utm_medium=cta', 'utm_medium=mid_article_cta')} class="mid-cta-link inline-flex items-center gap-2 px-6 py-2.5 rounded-full font-semibold text-sm tracking-wide transition-all duration-200 hover:opacity-90 hover:shadow-lg hover:shadow-primary/30" style="background: linear-gradient(90deg, #2670A5, #3D95CE); color: #ffffff;">
+        {ctaVariant.primary.label}
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+      </a>
+    </div>
+  </template>
+  <script is:inline>
+    document.addEventListener('DOMContentLoaded', function() {
+      var articlePath = window.location.pathname;
+      var articleTitle = document.querySelector('h1')?.textContent || '';
+
+      // Inject mid-article CTA after ~40% of content (lowered threshold so short posts get one too)
+      var articleBody = document.getElementById('article-body');
+      var ctaTemplate = document.getElementById('mid-article-cta');
+      if (articleBody && ctaTemplate) {
+        var headings = articleBody.querySelectorAll('h2, h3');
+        if (headings.length >= 2) {
+          var targetIndex = Math.max(1, Math.floor(headings.length * 0.4));
+          headings[targetIndex].parentNode.insertBefore(ctaTemplate.content.cloneNode(true), headings[targetIndex]);
+        }
+      }
+
+      // Mid-article CTA tracking
+      var midCta = document.querySelector('.mid-cta-link');
+      if (midCta) {
+        midCta.addEventListener('click', function() {
+          if (window.posthog) window.posthog.capture('blog:cta_click', {
+            cta_type: 'get_started', cta_position: 'mid_article', article_path: articlePath, article_title: articleTitle
+          });
+        });
+      }
+
+      // End-of-article CTA tracking
+      var endPrimary = document.querySelector('.end-cta-primary');
+      if (endPrimary) {
+        endPrimary.addEventListener('click', function() {
+          if (window.posthog) window.posthog.capture('blog:cta_click', {
+            cta_type: 'primary', cta_position: 'end_article', article_path: articlePath, article_title: articleTitle
+          });
+        });
+      }
+      var endSecondary = document.querySelector('.end-cta-secondary');
+      if (endSecondary) {
+        endSecondary.addEventListener('click', function() {
+          if (window.posthog) window.posthog.capture('blog:cta_click', {
+            cta_type: 'secondary', cta_position: 'end_article', article_path: articlePath, article_title: articleTitle
+          });
+        });
+      }
+
+      // Related article clicks
+      document.querySelectorAll('.blog-card[href^="/blog/"]').forEach(function(el) {
+        el.addEventListener('click', function() {
+          if (window.posthog) window.posthog.capture('blog:related_article_click', {
+            source_article: articlePath, target_article: el.getAttribute('href')
+          });
+        });
+      });
+
+      // External link clicks in article body
+      document.querySelectorAll('.prose a[href^="http"]').forEach(function(el) {
+        if (el.href && !el.href.includes('tryethernal.com')) {
+          el.addEventListener('click', function() {
+            if (window.posthog) window.posthog.capture('blog:external_link_click', {
+              article_path: articlePath, link_url: el.href
+            });
+          });
+        }
+      });
+
+      // Newsletter form
+      var form = document.getElementById('newsletter-form');
+      var msg = document.getElementById('newsletter-msg');
+      if (form) {
+        form.addEventListener('submit', function(e) {
+          e.preventDefault();
+          var email = form.querySelector('input[name="email"]').value;
+          var btn = form.querySelector('button');
+          btn.disabled = true;
+          btn.textContent = 'Subscribing...';
+          fetch('/api/marketing/newsletter', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: email })
+          }).then(function(r) {
+            if (!r.ok) throw new Error('Failed');
+            msg.textContent = 'You\'re subscribed! We\'ll send you new articles.';
+            msg.className = 'text-sm mt-3 text-green-400';
+            form.reset();
+            if (window.posthog) window.posthog.capture('blog:newsletter_subscribe', {
+              article_path: articlePath
+            });
+          }).catch(function() {
+            msg.textContent = 'Something went wrong. Try again?';
+            msg.className = 'text-sm mt-3 text-red-400';
+          }).finally(function() {
+            btn.disabled = false;
+            btn.textContent = 'Subscribe';
+          });
+        });
+      }
+    });
+  </script>
+</BaseLayout>

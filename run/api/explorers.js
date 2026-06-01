@@ -1,0 +1,1447 @@
+/**
+ * @fileoverview Explorer API endpoints.
+ * Manages explorer lifecycle: creation, configuration, syncing, and billing.
+ * @module api/explorers
+ *
+ * @route GET / - Get user's explorers (paginated)
+ * @route GET /:id - Get explorer by ID
+ * @route POST / - Create new explorer
+ * @route DELETE /:id - Delete explorer
+ * @route GET /search - Search explorer by domain
+ * @route GET /:id/orbitConfig - Get Orbit L2 configuration
+ * @route PUT /:id/orbitConfig - Update Orbit L2 configuration
+ * @route POST /:id/orbitConfig - Create Orbit L2 configuration
+ * @route PUT /:id/startSync - Start block synchronization
+ * @route PUT /:id/stopSync - Stop block synchronization
+ * @route GET /:id/syncStatus - Get synchronization status
+ * @route POST /:id/settings - Update explorer settings
+ * @route POST /:id/branding - Update explorer branding
+ * @route POST /:id/domains - Add custom domain
+ * @route POST /:id/faucets - Create faucet for explorer
+ * @route POST /:id/v2_dexes - Create V2 DEX for explorer
+ * @route GET /billing - Get billing summary
+ * @route GET /plans - Get available subscription plans
+ * @route POST /:id/subscription - Create subscription
+ * @route PUT /:id/subscription - Update subscription
+ * @route DELETE /:id/subscription - Cancel subscription
+ * @route POST /:id/startTrial - Start trial subscription
+ * @route POST /:id/cryptoSubscription - Create crypto payment subscription
+ * @route PUT /:id/quotaExtension - Update quota extension
+ * @route DELETE /:id/quotaExtension - Remove quota extension
+ */
+
+const { getNodeEnv, getAppDomain, getDefaultPlanSlug, getDefaultExplorerTrialDays, getStripeSecretKey } = require('../lib/env');
+const stripe = require('stripe')(getStripeSecretKey());
+const express = require('express');
+const router = express.Router();
+const { isStripeEnabled, isSelfHosted } = require('../lib/flags');
+const { ProviderConnector, DexConnector } = require('../lib/rpc');
+const { enqueue } = require('../lib/queue');
+const logger = require('../lib/logger');
+const { managedError, unmanagedError } = require('../lib/errors');
+const { Explorer } = require('../models');
+const { withTimeout, validateBNString, sanitize } = require('../lib/utils');
+const { bulkEnqueue } = require('../lib/queue');
+const PM2 = require('../lib/pm2');
+const db = require('../lib/firebase');
+const { isChainAllowed } = require('../lib/chains');
+const { getSupportedOpNetworks, isOpNetworkSupported } = require('../lib/opNetworks');
+const authMiddleware = require('../middlewares/auth');
+const stripeMiddleware = require('../middlewares/stripe');
+const secretMiddleware = require('../middlewares/secret');
+const { SYNC_FAILURE_THRESHOLD } = require('../lib/syncHelpers');
+
+/**
+ * Get orbit config for a given explorer
+ * @param {string} id - The explorer id
+ * @returns {Promise<object>} - The orbit config
+ */
+
+/**
+ * Get available L1 networks for OP Stack configuration
+ * Returns hardcoded list of supported networks (not internal workspace details)
+ * @returns {Promise<object>} - List of supported networks with networkId, name, explorerUrl
+ */
+router.get('/availableOpParents', authMiddleware, async (req, res, next) => {
+    try {
+        const availableNetworks = getSupportedOpNetworks();
+
+        res.status(200).json({ availableNetworks });
+    } catch (error) {
+        return managedError(error, req, res);
+    }
+});
+
+/**
+ * Get available L1 parent workspaces for the user
+ * Returns public L1s (Ethereum Mainnet, Arbitrum One) and user's custom L1s
+ * @returns {Promise<object>} - Object with publicParents and customParents arrays
+ */
+router.get('/availableL1Parents', authMiddleware, async (req, res, next) => {
+    try {
+        const { publicParents, customParents } = await db.getAvailableL1Parents(req.body.data.user.id);
+
+        res.status(200).json({ publicParents, customParents });
+    } catch (error) {
+        return managedError(error, req, res);
+    }
+});
+
+/**
+ * Create a custom L1 parent workspace
+ * @param {string} name - Name for the custom L1 parent
+ * @param {string} backendRpcServer - RPC server URL for backend sync
+ * @returns {Promise<object>} - The created workspace
+ */
+router.post('/customL1Parent', authMiddleware, async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        if (!data.name || !data.backendRpcServer)
+            return managedError(new Error('Missing parameters. Name and backend RPC server are required.'), req, res);
+
+        // Validate RPC and fetch network ID
+        let networkId;
+        const provider = new ProviderConnector(data.backendRpcServer);
+        try {
+            networkId = await withTimeout(provider.fetchNetworkId());
+            if (!networkId)
+                throw 'Error';
+        } catch(error) {
+            return managedError(new Error(`Our servers can't query this RPC, please use an RPC that is reachable from the internet.`), req, res);
+        }
+
+        let workspace;
+        try {
+            workspace = await db.createCustomL1Parent(data.user.id, {
+                name: data.name,
+                rpcServer: data.backendRpcServer,
+                networkId: networkId
+            });
+        } catch(error) {
+            if (error.name === 'SequelizeUniqueConstraintError') {
+                return managedError(new Error(`A workspace with name "${data.name}" already exists. Please choose a different name.`), req, res);
+            }
+            throw error;
+        }
+
+        res.status(200).json({
+            id: workspace.id,
+            name: workspace.name,
+            networkId: workspace.networkId,
+            rpcServer: workspace.rpcServer
+        });
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+/**
+ * Delete a custom L1 parent workspace
+ * Fails if the workspace has L2 children (Orbit or OP Stack configs)
+ * @param {number} id - Workspace ID
+ * @returns {Promise<void>} - 200 on success
+ */
+router.delete('/customL1Parent/:id', authMiddleware, async (req, res, next) => {
+    try {
+        if (!req.params.id)
+            return managedError(new Error('Missing parameters.'), req, res);
+
+        await db.deleteCustomL1Parent(req.body.data.user.id, parseInt(req.params.id));
+
+        res.sendStatus(200);
+    } catch(error) {
+        if (error.message.includes('Cannot delete') || error.message.includes('not found'))
+            return managedError(error, req, res);
+        unmanagedError(error, req, next);
+    }
+});
+
+router.get('/:id/orbitConfig', authMiddleware, async (req, res, next) => {
+    const data = { ...req.query, ...req.params };
+
+    try {
+        const orbitConfig = await db.getOrbitConfig(req.body.data.user.id, data.id);
+
+        res.status(200).json({ orbitConfig });
+    } catch (error) {
+        return managedError(error, req, res);
+    }
+});
+
+/**
+ * Update orbit config
+ * @param {object} config - The orbit config to update
+ * @param {string} config.parentChainRpcServer - RPC to use when sending claim transactions
+ * @param {string} config.parentChainExplorer - Explorer to use when linking to parent chain blocks/transactions
+ * @param {string} config.rollupContract - Rollup contract address
+ * @param {string} config.bridgeContract - Bridge contract address
+ * @param {string} config.inboxContract - Inbox contract address
+ * @param {string} config.sequencerInboxContract - Sequencer inbox contract address
+ * @param {string} config.outboxContract - Outbox contract address
+ * @param {string} config.l1GatewayRouter - L1 gateway router contract address
+ * @param {string} config.l1Erc20Gateway - L1 ERC20 gateway contract address
+ * @param {string} config.l1WethGateway - L1 WETH gateway contract address
+ * @param {string} config.l1CustomGateway - L1 custom gateway contract address
+ * @param {string} config.l2GatewayRouter - L2 gateway router contract address
+ * @param {string} config.l2Erc20Gateway - L2 ERC20 gateway contract address
+ * @param {string} config.l2WethGateway - L2 WETH gateway contract address
+ * @param {string} config.l2CustomGateway - L2 custom gateway contract address
+ * @param {string} config.challengeManagerContract - Challenge manager contract address
+ * @param {string} config.validatorWalletCreatorContract - Validator wallet creator contract address
+ * @param {string} config.stakeToken - Stake token address
+ * @param {string} config.parentMessageCountShift - The number of blocks to shift when counting messages
+ * @returns {Promise<object>} - The updated orbit config
+ */
+router.put('/:id/orbitConfig', authMiddleware, async (req, res, next) => {
+    const data = { ...req.query, ...req.params };
+
+    try {
+        const currentConfig = await db.getOrbitConfig(req.body.data.user.id, data.id);
+        if (!currentConfig)
+            return managedError(new Error('There is no orbit config for this explorer.'), req, res);
+
+        let params = { ...req.body.params };
+
+        if (params.config.parentChainRpcServer) {
+            let networkId;
+            const provider = new ProviderConnector(params.config.parentChainRpcServer);
+            try {
+                networkId = await withTimeout(provider.fetchNetworkId());
+                if (!networkId)
+                    throw 'Error';
+            } catch(error) {
+                return managedError(new Error(`Our servers can't query this rpc, please use a rpc that is reachable from the internet.`), req, res);
+            }
+
+            params.config.parentChainId = networkId;
+        }
+
+        let config;
+        try {
+            config = await db.updateOrbitConfig(req.body.data.user.id, data.id, params.config);
+        } catch(error) {
+            return managedError(error, req, res);
+        }
+
+        res.status(200).json({ config });
+    } catch (error) {
+        unmanagedError(error, req, res);
+    }
+});
+
+/**
+ * Create orbit config
+ * @param {object} config - The orbit config to create
+ * @param {string} config.parentChainRpcServer - RPC to use when sending claim transactions
+ * @param {string} config.parentChainExplorer - Explorer to use when linking to parent chain blocks/transactions
+ * @param {string} config.rollupContract - Rollup contract address
+ * @param {string} config.bridgeContract - Bridge contract address
+ * @param {string} config.inboxContract - Inbox contract address
+ * @param {string} config.sequencerInboxContract - Sequencer inbox contract address
+ * @param {string} config.outboxContract - Outbox contract address
+ * @param {string} config.l1GatewayRouter - L1 gateway router contract address
+ * @param {string} config.l1Erc20Gateway - L1 ERC20 gateway contract address
+ * @param {string} config.l1WethGateway - L1 WETH gateway contract address
+ * @param {string} config.l1CustomGateway - L1 custom gateway contract address
+ * @param {string} config.l2GatewayRouter - L2 gateway router contract address
+ * @param {string} config.l2Erc20Gateway - L2 ERC20 gateway contract address
+ * @param {string} config.l2WethGateway - L2 WETH gateway contract address
+ * @param {string} config.l2CustomGateway - L2 custom gateway contract address
+ * @param {string} config.challengeManagerContract - Challenge manager contract address
+ * @param {string} config.validatorWalletCreatorContract - Validator wallet creator contract address
+ * @param {string} config.stakeToken - Stake token address
+ * @param {string} config.parentMessageCountShift - The number of blocks to shift when counting messages
+ * @returns {Promise<object>} - The updated orbit config
+ */
+router.post('/:id/orbitConfig', authMiddleware, async (req, res, next) => {
+    const data = { ...req.query, ...req.params };
+
+    try {
+        const currentConfig = await db.getOrbitConfig(req.body.data.user.id, data.id);
+        if (currentConfig)
+            return managedError(new Error('There is already an orbit config for this explorer.'), req, res);
+
+        const configInput = req.body.params.config;
+        const userId = req.body.data.user.id;
+
+        // Validate parent chain selection:
+        // - parentWorkspaceId: existing public or custom L1 parent
+        // - customL1: { name, rpcServer } for creating new custom L1 inline
+        // Note: Orbit always requires parentChainRpcServer (frontend RPC for browser withdrawal claims)
+        const hasExistingParent = !!configInput.parentWorkspaceId;
+        const hasNewCustomL1 = configInput.customL1 && configInput.customL1.name && configInput.customL1.rpcServer;
+
+        if (!hasExistingParent && !hasNewCustomL1)
+            return managedError(new Error('Parent chain selection is required. Provide parentWorkspaceId or customL1 details.'), req, res);
+
+        if (!configInput.parentChainRpcServer)
+            return managedError(new Error('Parent chain RPC server is required (for browser-based withdrawal claims).'), req, res);
+
+        // Validate the frontend RPC is reachable
+        let networkId;
+        const provider = new ProviderConnector(configInput.parentChainRpcServer);
+        try {
+            networkId = await withTimeout(provider.fetchNetworkId());
+            if (!networkId)
+                throw 'Error';
+        } catch(error) {
+            return managedError(new Error(`Our servers can't query this RPC, please use an RPC that is reachable from the internet.`), req, res);
+        }
+
+        // Prepare config params for model layer
+        let configParams = { ...configInput, parentChainId: networkId };
+
+        // Handle custom L1 parent creation inline
+        if (hasNewCustomL1) {
+            // Validate backend RPC and fetch network ID
+            let backendNetworkId;
+            const backendProvider = new ProviderConnector(configInput.customL1.rpcServer);
+            try {
+                backendNetworkId = await withTimeout(backendProvider.fetchNetworkId());
+                if (!backendNetworkId)
+                    throw 'Error';
+            } catch(error) {
+                return managedError(new Error(`Our servers can't query the backend RPC, please use an RPC that is reachable from the internet.`), req, res);
+            }
+
+            // Create the custom L1 parent workspace
+            let customL1Workspace;
+            try {
+                customL1Workspace = await db.createCustomL1Parent(userId, {
+                    name: configInput.customL1.name,
+                    rpcServer: configInput.customL1.rpcServer,
+                    networkId: backendNetworkId
+                });
+            } catch(error) {
+                if (error.name === 'SequelizeUniqueConstraintError') {
+                    return managedError(new Error(`A workspace with name "${configInput.customL1.name}" already exists. Please choose a different name.`), req, res);
+                }
+                throw error;
+            }
+
+            configParams.parentWorkspaceId = customL1Workspace.id;
+            delete configParams.customL1;
+        }
+
+        let config;
+        try {
+            config = await db.createOrbitConfig(userId, data.id, configParams);
+        } catch(error) {
+            // Clean up orphaned custom L1 parent if config creation fails
+            if (hasNewCustomL1 && configParams.parentWorkspaceId) {
+                try {
+                    await db.deleteCustomL1Parent(userId, configParams.parentWorkspaceId);
+                } catch(cleanupError) {
+                    // Log but don't fail on cleanup error
+                }
+            }
+            return managedError(error, req, res);
+        }
+
+        // Start sync for custom L1 parent if applicable
+        if (config.parentWorkspaceId) {
+            await enqueue(
+                'startCustomL1ParentSync',
+                `startCustomL1ParentSync-${config.parentWorkspaceId}`,
+                { workspaceId: config.parentWorkspaceId },
+                1
+            );
+        }
+
+        res.status(200).json({ config });
+    } catch (error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+/**
+ * Get OP Stack config
+ * @returns {Promise<object>} - The OP config
+ */
+router.get('/:id/opConfig', authMiddleware, async (req, res, next) => {
+    const data = { ...req.query, ...req.params };
+
+    try {
+        const opConfig = await db.getOpConfig(req.body.data.user.id, data.id);
+
+        res.status(200).json({ opConfig });
+    } catch (error) {
+        return managedError(error, req, res);
+    }
+});
+
+/**
+ * Update OP Stack config
+ * @param {object} config - The OP config to update
+ * @param {string} config.batchInboxAddress - Batch inbox address
+ * @param {string} config.optimismPortalAddress - Optimism portal address
+ * @param {string} config.l2OutputOracleAddress - L2 output oracle address (legacy)
+ * @param {string} config.disputeGameFactoryAddress - Dispute game factory address (modern)
+ * @param {string} config.systemConfigAddress - System config address
+ * @param {string} config.l2ToL1MessagePasserAddress - L2 to L1 message passer address
+ * @param {number} config.outputVersion - Output version (0 = legacy, 1 = fault proofs)
+ * @param {number} config.submissionInterval - Blocks between output submissions
+ * @param {number} config.finalizationPeriodSeconds - Challenge period in seconds
+ * @param {string} config.parentChainExplorer - Parent chain explorer URL
+ * @returns {Promise<object>} - The updated OP config
+ */
+router.put('/:id/opConfig', authMiddleware, async (req, res, next) => {
+    const data = { ...req.query, ...req.params };
+
+    try {
+        const currentConfig = await db.getOpConfig(req.body.data.user.id, data.id);
+        if (!currentConfig)
+            return managedError(new Error('There is no OP config for this explorer.'), req, res);
+
+        let params = { ...req.body.params };
+
+        if (params.config.parentChainId) {
+            params.config.parentChainId = parseInt(params.config.parentChainId);
+        }
+
+        let config;
+        try {
+            config = await db.updateOpConfig(req.body.data.user.id, data.id, params.config);
+        } catch(error) {
+            return managedError(error, req, res);
+        }
+
+        res.status(200).json({ config });
+    } catch (error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+/**
+ * Create OP Stack config
+ * @param {object} config - The OP config to create
+ * @param {number} config.parentChainId - Parent chain network ID (e.g., 1 for Ethereum mainnet)
+ * @param {string} config.batchInboxAddress - Batch inbox address
+ * @param {string} config.optimismPortalAddress - Optimism portal address
+ * @param {string} config.l2OutputOracleAddress - L2 output oracle address (legacy)
+ * @param {string} config.disputeGameFactoryAddress - Dispute game factory address (modern)
+ * @param {string} config.systemConfigAddress - System config address
+ * @param {string} config.l2ToL1MessagePasserAddress - L2 to L1 message passer address
+ * @param {number} config.outputVersion - Output version (0 = legacy, 1 = fault proofs)
+ * @param {number} config.submissionInterval - Blocks between output submissions
+ * @param {number} config.finalizationPeriodSeconds - Challenge period in seconds
+ * @param {string} config.parentChainExplorer - Parent chain explorer URL
+ * @returns {Promise<object>} - The created OP config
+ */
+router.post('/:id/opConfig', authMiddleware, async (req, res, next) => {
+    const data = { ...req.query, ...req.params };
+
+    try {
+        const currentConfig = await db.getOpConfig(req.body.data.user.id, data.id);
+        if (currentConfig)
+            return managedError(new Error('There is already an OP config for this explorer.'), req, res);
+
+        const configInput = req.body.params.config;
+        const userId = req.body.data.user.id;
+
+        // Validate parent chain selection:
+        // - networkId: public L1 (legacy)
+        // - parentWorkspaceId: existing custom L1 parent
+        // - customL1: { name, rpcServer } for creating new custom L1 inline
+        const hasPublicL1 = !!configInput.networkId;
+        const hasExistingCustomL1 = !!configInput.parentWorkspaceId;
+        const hasNewCustomL1 = configInput.customL1 && configInput.customL1.name && configInput.customL1.rpcServer;
+
+        if (!hasPublicL1 && !hasExistingCustomL1 && !hasNewCustomL1)
+            return managedError(new Error('Parent chain selection is required. Provide networkId, parentWorkspaceId, or customL1 details.'), req, res);
+
+        // If using public L1 via networkId, validate it's supported
+        if (hasPublicL1 && !hasExistingCustomL1 && !hasNewCustomL1) {
+            const networkId = parseInt(configInput.networkId);
+            if (!isOpNetworkSupported(networkId))
+                return managedError(new Error('Selected network is not supported. Only Ethereum Mainnet is currently available.'), req, res);
+        }
+
+        if (!configInput.batchInboxAddress)
+            return managedError(new Error('Batch inbox address is required.'), req, res);
+
+        if (!configInput.optimismPortalAddress)
+            return managedError(new Error('Optimism portal address is required.'), req, res);
+
+        // Prepare config params for model layer
+        let configParams = { ...configInput };
+
+        // Handle custom L1 parent creation inline
+        if (hasNewCustomL1) {
+            // Validate RPC and fetch network ID
+            let networkId;
+            const provider = new ProviderConnector(configInput.customL1.rpcServer);
+            try {
+                networkId = await withTimeout(provider.fetchNetworkId());
+                if (!networkId)
+                    throw 'Error';
+            } catch(error) {
+                return managedError(new Error(`Our servers can't query this RPC, please use an RPC that is reachable from the internet.`), req, res);
+            }
+
+            // Create the custom L1 parent workspace
+            let customL1Workspace;
+            try {
+                customL1Workspace = await db.createCustomL1Parent(userId, {
+                    name: configInput.customL1.name,
+                    rpcServer: configInput.customL1.rpcServer,
+                    networkId: networkId
+                });
+            } catch(error) {
+                if (error.name === 'SequelizeUniqueConstraintError') {
+                    return managedError(new Error(`A workspace with name "${configInput.customL1.name}" already exists. Please choose a different name.`), req, res);
+                }
+                throw error;
+            }
+
+            configParams.parentWorkspaceId = customL1Workspace.id;
+            delete configParams.customL1;
+        } else if (hasPublicL1 && !hasExistingCustomL1) {
+            // Convert networkId to parentChainId for legacy public L1 path
+            configParams.parentChainId = parseInt(configInput.networkId);
+        }
+        delete configParams.networkId;
+
+        let config;
+        try {
+            config = await db.createOpConfig(userId, data.id, configParams);
+        } catch(error) {
+            // Clean up orphaned custom L1 parent if config creation fails
+            if (hasNewCustomL1 && configParams.parentWorkspaceId) {
+                try {
+                    await db.deleteCustomL1Parent(userId, configParams.parentWorkspaceId);
+                } catch(cleanupError) {
+                    // Log but don't fail on cleanup error
+                }
+            }
+            return managedError(error, req, res);
+        }
+
+        // Start sync for custom L1 parent if applicable
+        if (config.parentWorkspaceId) {
+            await enqueue(
+                'startCustomL1ParentSync',
+                `startCustomL1ParentSync-${config.parentWorkspaceId}`,
+                { workspaceId: config.parentWorkspaceId },
+                1
+            );
+        }
+
+        res.status(200).json({ config });
+    } catch (error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.post('/:id/v2_dexes', authMiddleware, async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        if (!data.routerAddress || !data.wrappedNativeTokenAddress)
+            return managedError(new Error('Missing parameters'), req, res);
+
+        const explorer = await db.getExplorerById(data.user.id, req.params.id);
+        if (!explorer || !explorer.workspace)
+            return managedError(new Error('Could not find explorer.'), req, res);
+
+        let routerFactoryAddress;
+        try {
+            const dexConnector = new DexConnector(explorer.workspace.rpcServer, data.routerAddress);
+            routerFactoryAddress = await dexConnector.getFactory();
+        } catch(error) {
+            return managedError(new Error(`Couldn't get factory address for router. Check that the factory method is present and returns an address.`), req, res);
+        }
+
+        if (!routerFactoryAddress || typeof routerFactoryAddress != 'string' || routerFactoryAddress.length != 42 || !routerFactoryAddress.startsWith('0x'))
+            return managedError(new Error(`Invalid factory address.`), req, res);
+
+        const v2Dex = await db.createExplorerV2Dex(data.uid, req.params.id, data.routerAddress, routerFactoryAddress, data.wrappedNativeTokenAddress);
+
+        res.status(200).json({ v2Dex });
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.post('/:id/faucets', authMiddleware, async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        if (!data.amount || !data.interval)
+            return managedError(new Error('Missing parameters'), req, res);
+        if (!validateBNString(data.amount))
+            return managedError(new Error('Invalid amount.'), req, res);
+        if (isNaN(parseFloat(data.interval)) || parseFloat(data.interval) <= 0)
+            return managedError(new Error('Interval must be greater than 0.'), req, res);
+
+        const faucet = await db.createFaucet(data.uid, req.params.id, data.amount, data.interval);
+
+        res.status(200).json({
+            id: faucet.id,
+            active: faucet.active,
+            address: faucet.address,
+            amount: faucet.amount,
+            interval: faucet.interval
+        });
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.get('/billing', [authMiddleware, stripeMiddleware], async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        const user = await db.getUser(data.uid);
+
+        const result = await db.getUserExplorers(user.id, 1, 100);
+
+        const explorerIds = result.items.map(e => e.id);
+        const subscriptions = await db.getStripeSubscriptionsByExplorerIds(explorerIds);
+        const subsByExplorerId = new Map(subscriptions.map(s => [s.explorerId, s]));
+
+        const activeExplorers = [];
+        const costPromises = [];
+
+        for (let i = 0; i < result.items.length; i++) {
+            const explorer = result.items[i];
+            const stripeSubscription = subsByExplorerId.get(explorer.id);
+            if (!stripeSubscription)
+                continue;
+
+            const planName = stripeSubscription.stripePlan.name;
+            const idx = activeExplorers.length;
+            activeExplorers.push({ id: explorer.id, name: explorer.name, planName, planCost: 0, subscriptionStatus: stripeSubscription.formattedStatus });
+
+            if (stripeSubscription.stripeId) {
+                costPromises.push(
+                    stripe.invoices.listUpcomingLines({ subscription: stripeSubscription.stripeId })
+                        .then(upcomingLines => {
+                            const amounts = upcomingLines.data.map(line => line.amount && line.amount > 0 ? line.amount : 0);
+                            activeExplorers[idx].planCost = parseFloat(amounts.reduce((acc, curr) => acc + curr, 0)) / 100;
+                        })
+                        .catch(error => {
+                            if (error.code !== 'invoice_upcoming_none')
+                                throw error;
+                        })
+                );
+            }
+        }
+
+        await Promise.all(costPromises);
+
+        const totalCost = activeExplorers.reduce((acc, curr) => acc + curr.planCost, 0);
+        res.status(200).json({ activeExplorers, totalCost });
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.post('/:id/startTrial', authMiddleware, async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        if (!data.stripePlanSlug)
+            return managedError(new Error('Missing parameter'), req, res);
+
+        const user = await db.getUser(data.uid, ['stripeCustomerId', 'canTrial']);
+        if (!user)
+            return managedError(new Error('Could not find user.'), req, res);
+
+        if (!user.canTrial)
+            return managedError(new Error(`You've already used your trial.`), req, res);
+
+        const explorer = await db.getExplorerById(user.id, req.params.id);
+        if (!explorer)
+            return managedError(new Error('Could not find explorer.'), req, res);
+
+        const plan = await db.getStripePlan(data.stripePlanSlug);
+        if (!plan)
+            return managedError(new Error('Could not find plan.'), req, res);
+
+        const subscription = await stripe.subscriptions.create({
+            customer: user.stripeCustomerId,
+            items: [{ price: plan.stripePriceId }],
+            trial_period_days: getDefaultExplorerTrialDays(),
+            trial_settings: {
+                end_behavior: { missing_payment_method: 'cancel' }
+            },
+            metadata: { explorerId: explorer.id }
+        });
+
+        if (!subscription)
+            return managedError(new Error('Error while starting trial. Please try again.'), req, res);
+
+        const customer = await stripe.customers.retrieve(subscription.customer);
+
+        await db.createExplorerSubscription(user.id, explorer.id,  plan.id, { ...subscription, customer });
+        await db.disableUserTrial(user.id);
+
+        res.sendStatus(200);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.post('/syncExplorers', secretMiddleware, async (req, res, next) => {
+    try {
+        const explorers = await Explorer.findAll();
+
+        const jobs = [];
+        for (let i = 0; i < explorers.length; i++) {
+            const explorer = explorers[i];
+            jobs.push({
+                name: `updateExplorerSyncingProcess-${explorer.id}`,
+                data: { explorerSlug: explorer.slug }
+            });
+        }
+
+        await bulkEnqueue('updateExplorerSyncingProcess', jobs);
+
+        res.sendStatus(200);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+/**
+ * Report a sync failure for an explorer
+ * Used by PM2 server and sync jobs to report RPC failures
+ * @route POST /api/explorers/:slug/syncFailure
+ * @param {string} slug - Explorer slug
+ * @param {string} reason - Failure reason (e.g., 'rpc_error', 'rpc_unreachable')
+ * @param {string} source - Source of the failure (e.g., 'pm2', 'blockSync', 'receiptSync')
+ * @returns {object} - Result with disabled status, attempts count, and message
+ */
+router.post('/:slug/syncFailure', secretMiddleware, async (req, res, next) => {
+    try {
+        const { slug } = req.params;
+        const { reason, source } = req.body;
+
+        const explorer = await Explorer.findOne({ where: { slug } });
+        if (!explorer) {
+            return res.status(404).json({ error: 'Explorer not found' });
+        }
+
+        const result = await explorer.incrementSyncFailures(reason || 'rpc_error');
+
+        logger.info({
+            message: 'Sync failure reported',
+            explorerSlug: slug,
+            reason: reason || 'rpc_error',
+            source: source || 'unknown',
+            attempts: result.attempts,
+            disabled: result.disabled
+        });
+
+        res.status(200).json({
+            disabled: result.disabled,
+            attempts: result.attempts,
+            message: result.disabled
+                ? `Sync auto-disabled after ${result.attempts} failures`
+                : `Failure recorded (attempt ${result.attempts}/${SYNC_FAILURE_THRESHOLD})`
+        });
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.put('/:id/stopSync', [authMiddleware], async (req, res, next) => {
+    try {
+        if (!req.params.id)
+            return managedError(new Error('Missing parameters'), req, res);
+
+        const explorer = await db.getExplorerById(req.body.data.user.id, req.params.id);
+        if (!explorer)
+            return managedError(new Error(`Couldn't find explorer.`), req, res);
+
+        // We rely on the afterUpdate hook to update the pm2 process. The frontend needs to take care of waiting for the new state
+        await db.stopExplorerSync(explorer.id);
+
+        res.sendStatus(200);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.put('/:id/startSync', [authMiddleware], async (req, res, next) => {
+    try {
+        if (!req.params.id)
+            return managedError(new Error('Missing parameters'), req, res);
+
+        const explorer = await db.getExplorerById(req.body.data.user.id, req.params.id);
+
+        if (!explorer)
+            return managedError(new Error(`Couldn't find explorer.`), req, res);
+
+        if (!explorer.stripeSubscription)
+            return managedError(new Error(`No active subscription for this explorer.`), req, res);
+
+        if (await explorer.hasReachedTransactionQuota())
+            return managedError(new Error('Transaction quota reached. Upgrade your plan to resume sync.'), req, res);
+
+        const provider = new ProviderConnector(explorer.workspace.rpcServer);
+        try {
+            await withTimeout(provider.fetchNetworkId());
+        } catch(error) {
+            return managedError(new Error(`This explorer's RPC is not reachable. Please update it in order to start syncing.`), req, res);
+        }
+
+        // We rely on the afterUpdate hook to update the pm2 process. The frontend needs to take care of waiting for the new state
+        await db.startExplorerSync(explorer.id);
+
+        res.sendStatus(200);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.get('/:id/syncStatus', [authMiddleware], async (req, res, next) => {
+    try {
+        if (!req.params.id)
+            return managedError(new Error('Missing parameters'), req, res);
+
+        const explorer = await db.getExplorerById(req.body.data.user.id, req.params.id);
+        if (!explorer)
+            return managedError(new Error(`Can't find explorer.`), req, res);
+
+        let status;
+        if (explorer.workspace.rpcHealthCheck && !explorer.workspace.rpcHealthCheck.isReachable) {
+            status = 'unreachable';
+        }
+        else if (await explorer.hasReachedTransactionQuota()) {
+            status = 'transactionQuotaReached';
+        }
+        else {
+            const pm2 = new PM2(process.env.PM2_HOST, process.env.PM2_SECRET);
+            const { data: { pm2_env: pm2Process }} = await pm2.find(explorer.slug);
+            status = pm2Process ? pm2Process.status : 'stopped';
+        }
+
+        res.status(200).json({ status });
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.delete('/:id/quotaExtension', [authMiddleware, stripeMiddleware], async (req, res, next) => {
+    try {
+        const explorer = await db.getExplorerById(req.body.data.user.id, req.params.id);
+
+        if (!explorer || !explorer.stripeSubscription)
+            return managedError(new Error(`Can't find explorer.`), req, res);
+
+        if (!explorer.stripeSubscription.stripeQuotaExtension)
+            return res.sendStatus(200);
+
+        await stripe.subscriptionItems.del(explorer.stripeSubscription.stripeQuotaExtension.stripeId);
+
+        await db.destroyStripeQuotaExtension(explorer.stripeSubscription.id);
+
+        await explorer.stripeSubscription.reload();
+
+        res.status(200).json({ stripeSubscription: explorer.stripeSubscription });
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.put('/:id/quotaExtension', [authMiddleware, stripeMiddleware], async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        if (!data.quota || !data.stripePlanSlug)
+            return managedError(new Error('Missing parameters.'), req, res);
+
+        if (data.quota < 10000)
+            return managedError(new Error('Quota extension needs to be at least 10,000.'), req, res);
+
+        const explorer = await db.getExplorerById(data.user.id, req.params.id);
+
+        if (!explorer || !explorer.stripeSubscription)
+            return managedError(new Error(`Can't find explorer.`), req, res);
+
+        const stripePlan = await db.getStripePlan(data.stripePlanSlug);
+        if (!stripePlan || !stripePlan.capabilities.quotaExtension)
+            return managedError(new Error(`Can't find plan.`), req, res);
+
+        const stripeQuotaExtension = explorer.stripeSubscription.stripeQuotaExtension;
+        const items = [];
+
+        if (stripeQuotaExtension)
+            items.push({ id: stripeQuotaExtension.stripeId, quantity: data.quota });
+        else
+            items.push({ price: stripePlan.stripePriceId, quantity: data.quota });
+
+        const subscription = await stripe.subscriptions.update(explorer.stripeSubscription.stripeId, {
+            cancel_at_period_end: false,
+            proration_behavior: 'always_invoice',
+            items
+        });
+        const stripeItem = subscription.items.data.find(i => i.price.id == stripePlan.stripePriceId);
+
+        if (stripeQuotaExtension)
+            await db.updateStripeQuotaExtension(explorer.stripeSubscription.id, data.quota);
+        else
+            await db.createStripeQuotaExtension(explorer.stripeSubscription.id, stripeItem.id, stripePlan.id, data.quota);
+
+        await explorer.stripeSubscription.reload();
+
+        res.status(200).json({ stripeSubscription: explorer.stripeSubscription });
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.put('/:id/subscription', [authMiddleware, stripeMiddleware], async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        if (!data.newStripePlanSlug)
+            return managedError(new Error('Missing parameters.'), req, res);
+
+        const explorer = await db.getExplorerById(data.user.id, req.params.id);
+
+        if (!explorer || !explorer.stripeSubscription)
+            return managedError(new Error(`Can't find explorer.`), req, res);
+
+        if (explorer.stripeSubscription.stripePlan.slug != data.newStripePlanSlug && explorer.stripeSubscription.isPendingCancelation)
+            return managedError(new Error(`Revert plan cancelation before choosing a new plan.`), req, res);
+
+        const stripePlan = await db.getStripePlan(data.newStripePlanSlug);
+        if (!stripePlan || !stripePlan.public)
+            return managedError(new Error(`Can't find plan.`), req, res);
+
+        let subscription;
+        if (explorer.stripeSubscription.stripeId) {
+            subscription = await stripe.subscriptions.retrieve(explorer.stripeSubscription.stripeId, { expand: ['customer']});
+            if (stripePlan.price == 0) {
+                await stripe.subscriptions.cancel(subscription.id, {
+                    prorate: true
+                });
+                await db.deleteExplorerSubscription(data.user.id, explorer.id);
+                await db.createExplorerSubscription(data.user.id, explorer.id, stripePlan.id);
+            }
+            else
+                await stripe.subscriptions.update(subscription.id, {
+                    cancel_at_period_end: false,
+                    proration_behavior: 'always_invoice',
+                    items: [{
+                        id: subscription.items.data[0].id,
+                        price: stripePlan.stripePriceId
+                    }]
+                });
+        }
+ 
+        if (explorer.stripeSubscription.isPendingCancelation)
+            await db.revertExplorerSubscriptionCancelation(data.user.id, explorer.id);
+        else if (stripePlan.price > 0)
+            await db.updateExplorerSubscription(data.user.id, explorer.id, stripePlan.id, subscription);
+
+        res.sendStatus(200);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.post('/:id/subscription', [authMiddleware, stripeMiddleware], async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        if (!data.planSlug)
+            return managedError(new Error('Missing parameters.'), req, res);
+
+        const explorer = await db.getExplorerById(data.user.id, req.params.id);
+
+        if (!explorer)
+            return managedError(new Error(`Can't find explorer.`), req, res);
+
+        if (explorer.stripeSubscription)
+            return managedError(new Error(`Explorer already has a subscription.`), req, res);
+
+        const stripePlan = await db.getStripePlan(data.planSlug);
+        if (!stripePlan)
+            return managedError(new Error(`Can't find plan.`), req, res);
+
+        if (!stripePlan.capabilities.skipBilling && stripePlan.price > 0)
+            return managedError(new Error(`This plan cannot be used via the API at the moment. Start the subscription using the dashboard, or reach out to contact@tryethernal.com.`), req, res);
+
+        await db.createExplorerSubscription(data.user.id, explorer.id, stripePlan.id);
+
+        res.sendStatus(200);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.delete('/:id/subscription', [authMiddleware, stripeMiddleware], async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        const explorer = await db.getExplorerById(data.user.id, req.params.id);
+
+        if (!explorer || !explorer.stripeSubscription)
+            return managedError(new Error(`Can't find explorer.`), req, res);
+
+        if (explorer.stripeSubscription.stripeId) {
+            const subscription = await stripe.subscriptions.retrieve(explorer.stripeSubscription.stripeId);
+            await stripe.subscriptions.update(subscription.id, {
+                cancel_at_period_end: true
+            });
+            if (explorer.stripeSubscription.stripePlan.price == 0)
+                await db.deleteExplorerSubscription(data.user.id, explorer.id);
+            else
+                await db.cancelExplorerSubscription(data.user.id, explorer.id);
+        }
+        else
+            await db.deleteExplorerSubscription(data.user.id, explorer.id);
+
+        res.sendStatus(200);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.post('/:id/cryptoSubscription', [authMiddleware, stripeMiddleware], async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        if (!data.stripePlanSlug)
+            return managedError(new Error('Missing parameter'), req, res);
+
+        if (!data.user.cryptoPaymentEnabled)
+            return managedError(new Error(`Crypto payment is not available for your account. Please reach out to contact@tryethernal.com if you'd like to enable it.`), req, res);
+
+        const explorer = await db.getExplorerById(data.user.id, req.params.id, true);
+        if (!explorer)
+            return managedError(new Error(`Can't find explorer.`), req, res);
+
+        const stripePlan = await db.getStripePlan(data.stripePlanSlug);
+        if (!stripePlan || !stripePlan.public)
+            return managedError(new Error(`Can't find plan.`), req, res);
+
+        await stripe.subscriptions.create({
+            customer: data.user.stripeCustomerId,
+            collection_method: 'send_invoice',
+            days_until_due: getDefaultExplorerTrialDays(),
+            items: [
+                { price: stripePlan.stripePriceId }
+            ],
+            metadata: {
+                explorerId: explorer.id
+            }
+        });
+
+        res.sendStatus(200);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.delete('/:id', authMiddleware, async (req, res, next) => {
+    const data = { ...req.body.data, ...req.query };
+
+    logger.error('Deleting explorer', { location: 'delete.api.explorers', data });
+
+    try {
+        const explorer = await db.getExplorerById(data.user.id, req.params.id);
+        if (!explorer)
+            return managedError(new Error(`Could not delete explorer.`), req, res);
+
+        if (data.cancelSubscription && explorer.stripeSubscription) {
+            if (explorer.stripeSubscription.stripePlan.capabilities.volumeSubscription) {
+                const subscription = await stripe.subscriptions.retrieve(explorer.stripeSubscription.stripeId);
+                const item = subscription.items.data[0];
+                await stripe.subscriptionItems.update(item.id, {
+                    quantity: item.quantity - 1,
+                    proration_behavior: 'always_invoice'
+                });
+                await db.deleteExplorerSubscription(data.user.id, explorer.id);
+
+            }
+            else if (explorer.stripeSubscription.stripeId) {
+                const subscription = await stripe.subscriptions.retrieve(explorer.stripeSubscription.stripeId);
+                await stripe.subscriptions.update(subscription.id, {
+                    cancel_at_period_end: true
+                });
+                await db.cancelExplorerSubscription(data.user.id, explorer.id);
+            }
+            else
+                await db.deleteExplorerSubscription(data.user.id, explorer.id);
+        }
+        else if (explorer.stripeSubscription)
+            return managedError(new Error(`Can't delete an explorer with an active subscription.`), req, res);
+
+        await db.deleteExplorer(data.user.id, explorer.id);
+
+        if (data.deleteWorkspace)
+            await db.markWorkspaceForDeletion(data.user.id, explorer.workspaceId);
+            await enqueue('workspaceReset', `workspaceReset-${explorer.workspaceId}`, {
+                workspaceId: explorer.workspaceId,
+                from: new Date(0),
+                to: new Date()
+            });
+            await enqueue('deleteWorkspace', `deleteWorkspace-${explorer.workspaceId}`, {
+                workspaceId: explorer.workspaceId
+            });
+
+        res.sendStatus(200);
+    } catch(error) {
+        console.log(error);
+        unmanagedError(error, req, next);
+    }
+});
+
+router.get('/plans', [authMiddleware, stripeMiddleware], async (req, res, next) => {
+    try {
+        const plans = await db.getExplorerPlans();
+
+        res.status(200).json(plans);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.get('/quotaExtensionPlan', [authMiddleware, stripeMiddleware], async (req, res, next) => {
+    try {
+        const plan = await db.getQuotaExtensionPlan();
+
+        res.status(200).json(plan);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.post('/:id/domains', authMiddleware, async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        if (!data.domain)
+            return managedError(new Error('Missing parameter'), req, res);
+
+        if (data.domain.endsWith(getAppDomain()))
+            return managedError(new Error(`You can only have one ${getAppDomain()} domain. If you'd like a different one, update the "Ethernal Domain" field, in the "Settings" panel.`), req, res);
+
+        const explorer = await db.getExplorerById(data.user.id, req.params.id);
+        if (!explorer)
+            return managedError(new Error('Could not find explorer.'), req, res);
+
+        const explorerDomain = await db.createExplorerDomain(explorer.id, data.domain);
+
+        res.status(200).send({ id: explorerDomain.id });
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.post('/:id/branding', authMiddleware, async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        const explorer = await db.getExplorerById(data.user.id, req.params.id);
+        if (!explorer)
+            return managedError(new Error('Could not find explorer.'), req, res);
+
+        await db.updateExplorerBranding(explorer.id, data);
+
+        res.sendStatus(200);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.post('/:id/settings', authMiddleware, async (req, res, next) => {
+    const data = req.body.data;
+
+    try {
+        const explorer = await db.getExplorerById(data.user.id, req.params.id);
+        if (!explorer)
+            return managedError(new Error('Could not find explorer.'), req, res);
+
+        if (data.rpcServer && data.rpcServer != explorer.rpcServer) {
+            let networkId;
+            const provider = new ProviderConnector(data.rpcServer);
+            try {
+                networkId = await withTimeout(provider.fetchNetworkId());
+                if (!networkId)
+                    throw 'Error';
+            } catch(error) {
+                return managedError(new Error(`Our servers can't query this rpc, please use a rpc that is reachable from the internet.`), req, res);
+            }
+        }
+
+        try {
+            await db.updateExplorerSettings(explorer.id, data);
+        } catch(error) {
+            return managedError(new Error(error), req, res);
+        }
+
+        res.sendStatus(200);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.post('/', authMiddleware, async (req, res, next) => {
+    const data = req.body.data;
+
+    const backendRpcServer = data.backendRpcServer || data.rpcServer;
+
+    try {
+        if (!backendRpcServer || !data.name)
+            return managedError(new Error('Missing parameters.'), req, res);
+
+        const user = await db.getUser(data.uid, ['stripeCustomerId', 'canUseDemoPlan']);
+
+        let networkId;
+        const provider = new ProviderConnector(backendRpcServer);
+        try {
+            networkId = await withTimeout(provider.fetchNetworkId());
+            if (!networkId)
+                throw 'Error';
+        } catch(error) {
+            return managedError(new Error(`Our servers can't query this rpc, please use a rpc that is reachable from the internet.`), req, res);
+        }
+
+        let options = {
+            name: data.name,
+            backendRpcServer,
+            chain: data.chain,
+            networkId,
+            tracing: data.tracing,
+            frontendRpcServer: data.frontendRpcServer
+        };
+
+        if (data.faucet && data.faucet.amount && data.faucet.interval)
+            options['faucet'] = { amount: data.faucet.amount, interval: data.faucet.interval };
+
+        if (data.domains && Array.isArray(data.domains))
+            options['domains'] = data.domains;
+
+        options['token'] = data.token;
+        options['slug'] = data.slug;
+        options['totalSupply'] = data.totalSupply;
+        options['branding'] = data.branding;
+
+        const usingDefaultPlan = !data.plan && (!isStripeEnabled() || user.canUseDemoPlan);
+        const planSlug = usingDefaultPlan ? getDefaultPlanSlug() : data.plan;
+
+        let stripePlan;
+        if (planSlug) {
+            stripePlan = await db.getStripePlan(planSlug);
+            if (!stripePlan)
+                return managedError(new Error(`Can't find plan.`), req, res);
+
+            if (usingDefaultPlan || stripePlan.capabilities.skipBilling) {
+                options['subscription'] = {
+                    stripePlanId: stripePlan.id,
+                    stripeId: null,
+                    cycleEndsAt: new Date(0),
+                    status: 'active'
+                }
+            }
+
+            if (stripePlan.capabilities.customStartingBlock)
+                options['integrityCheckStartBlockNumber'] = data.fromBlock;
+
+            if (stripePlan.capabilities.volumeSubscription) {
+                const stripeSubscription = await db.getUserStripeSubscription(user.id);
+                let subscription;
+                if (stripeSubscription) {
+                    subscription = await stripe.subscriptions.retrieve(stripeSubscription.stripeId);
+                    const item = subscription.items.data[0];
+                    await stripe.subscriptionItems.update(item.id, {
+                        quantity: item.quantity + 1,
+                        proration_behavior: 'always_invoice'
+                    });
+                }
+                else {
+                    subscription = await stripe.subscriptions.create({
+                        customer: user.stripeCustomerId,
+                        items: [
+                            { price: stripePlan.stripePriceId, quantity: 1 }
+                        ]
+                    });
+                    await db.createUserStripeSubscription(user.id, subscription, stripePlan);
+                }
+
+                if (subscription)
+                    options['subscription'] = {
+                        stripePlanId: stripePlan.id,
+                        stripeId: subscription.id,
+                        cycleEndsAt: new Date(subscription.current_period_end * 1000),
+                        status: subscription.status
+                    };
+                else
+                    return managedError(new Error(`Couldn't create subscription.`), req, res);
+            }
+        }
+
+        if (!stripePlan || !stripePlan.capabilities.allowAllChains) {
+            const allowed = await isChainAllowed(networkId);
+            if (!allowed)
+                return managedError(new Error('You can\'t create an explorer with this network id (' + networkId + '). If you\'d still like an explorer for this chain. Please reach out to contact@tryethernal.com, and we\'ll set one up for you.'), req, res);
+        }
+
+        let explorer;
+        try {
+            explorer = await db.createExplorerFromOptions(user.id, sanitize(options));
+        } catch(error) {
+            return managedError(new Error(error), req, res);
+        }
+
+        if (!explorer)
+            return managedError(new Error('Could not create explorer.'), req, res);
+
+        if (!usingDefaultPlan && stripePlan && req.query.startSubscription && !options['subscription'] && stripePlan.stripePriceId) {
+            let stripeParams = {
+                customer: user.stripeCustomerId,
+                items: [
+                    { price: stripePlan.stripePriceId }
+                ],
+                metadata: {
+                    explorerId: explorer.id
+                }
+            };
+
+            if (!user.cryptoPaymentEnabled) {
+                const stripeCustomer = await stripe.customers.retrieve(user.stripeCustomerId);
+                if (!stripeCustomer.default_source && (!stripeCustomer.invoice_settings || !stripeCustomer.invoice_settings.default_payment_method))
+                    return managedError(new Error(`There doesn't seem to be a payment method associated to your account. If you never subscribed to an explorer plan, please start your first one using the dashboard. You can also reach out to support on Discord or at contact@tryethernal.com.`), req, res);
+            }
+            else {
+                stripeParams['collection_method'] = 'send_invoice';
+                stripeParams['days_until_due'] = 7;
+            }
+
+            await stripe.subscriptions.create(stripeParams);
+        }
+
+        const fields = {
+            id: explorer.id,
+            domain: explorer.domain,
+            domains: explorer.domains,
+            name: explorer.name,
+            slug: explorer.slug,
+        };
+
+        if (explorer.faucet) {
+            fields['faucet'] = {
+                id: explorer.faucet.id,
+                address: explorer.faucet.address,
+                amount: explorer.faucet.amount,
+                interval: explorer.faucet.interval
+            }
+        }
+
+        res.status(200).send(fields);
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.get('/search', async (req, res, next) => {
+    const data = req.query;
+
+    try {
+        if (!data.domain || typeof data.domain !== 'string')
+            return managedError(new Error('Missing parameters.'), req, res);
+
+        let explorer;
+
+        // Workaround for saas version that is hosted on app.
+        if (!isSelfHosted() && data.domain == `app.${getAppDomain()}`)
+            return res.sendStatus(200);
+
+        if (data.domain == getAppDomain())
+            return res.sendStatus(200);
+
+        if (data.domain.endsWith(getAppDomain())) {
+            const slug = data.domain.split(`.${getAppDomain()}`)[0];
+            explorer = await db.getPublicExplorerParamsBySlug(slug);
+        }
+
+        if (!explorer)
+            explorer = await db.getPublicExplorerParamsByDomain(data.domain); // This method will return null if the current explorer plan doesn't have the "customDomain" capability
+
+        if (!explorer)
+            return res.status(400).json({ error: "Couldn't find explorer.", mainDomain: getAppDomain() });
+
+        if (!explorer.stripeSubscription)
+            return res.status(400).json({ error: "This explorer is not active.", mainDomain: getAppDomain() });
+
+        const capabilities = explorer.stripeSubscription.stripePlan.capabilities;
+
+        const fields = {
+            id: explorer.id,
+            chainId: explorer.chainId,
+            domain: explorer.domain,
+            domains: explorer.domains,
+            name: explorer.name,
+            rpcServer: explorer.rpcServer,
+            slug: explorer.slug,
+            admin: explorer.admin,
+            workspace: explorer.workspace,
+            gasAnalyticsEnabled: explorer.gasAnalyticsEnabled,
+            displayTopAccounts: explorer.displayTopAccounts,
+            isDemo: explorer.isDemo,
+            mainDomain: getAppDomain()
+        };
+
+        fields['token'] = capabilities.nativeToken ? explorer.token : 'ether';
+        fields['themes'] = capabilities.branding ? explorer.themes : { 'light': {}};
+        fields['totalSupply'] = capabilities.totalSupply ? explorer.totalSupply : null;
+        fields['adsEnabled'] = capabilities.adsEnabled == undefined || capabilities.adsEnabled == null ? true : capabilities.adsEnabled;
+
+        if (explorer.faucet && explorer.faucet.active)
+            fields['faucet'] = {
+                id: explorer.faucet.id,
+                address: explorer.faucet.address,
+                amount: explorer.faucet.amount,
+                interval: explorer.faucet.interval
+            };
+
+        if (explorer.v2Dex && explorer.v2Dex.active)
+            fields['v2Dex'] = {
+                id: explorer.v2Dex.id,
+                routerAddress: explorer.v2Dex.routerAddress
+            };
+
+            res.status(200).json({ explorer: fields });
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.get('/:id', authMiddleware, async (req, res, next) => {
+    const data = req.params;
+
+    try {
+        if (!data.id)
+            return managedError(new Error('Missing parameters.'), req, res);
+
+        const explorer = await db.getExplorerById(req.body.data.user.id, data.id);
+
+        if (!explorer)
+            return managedError(new Error('Could not find explorer.'), req, res);
+
+        res.status(200).json(explorer.toJSON());
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+router.get('/', authMiddleware, async (req, res, next) => {
+    const data = { ...req.body.data, ...req.query };
+
+    try {
+        const explorers = await db.getUserExplorers(data.user.id, data.page, data.itemsPerPage, data.order, data.orderBy)
+
+        res.status(200).json(explorers)
+    } catch(error) {
+        unmanagedError(error, req, next);
+    }
+});
+
+module.exports = router;
