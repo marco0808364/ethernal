@@ -1,18 +1,45 @@
+/**
+ * Main stylesheet for Ethernal application
+ * @fileoverview Global styles, theme variables, and utility classes
+ * @module styles/main
+ */
+
+// Import theme components
 @import 'theme-variables';
 @import 'theme-transitions';
 
+/* ==========================================================================
+   Typography & Branding
+   ========================================================================== */
+
+/**
+ * Logo styling with Exo font family
+ * @class .logo
+ */
 .logo {
     font-family: "Exo";
     font-weight: 600;
     color: rgb(var(--v-theme-primary));
 }
 
+/**
+ * White logo variant
+ * @class .logo-white
+ */
 .logo-white {
     font-family: "Exo";
     font-weight: 600;
     color: white;
 }
 
+/* ==========================================================================
+   Layout Components
+   ========================================================================== */
+
+/**
+ * Vertical divider alignment
+ * @class div > .v-divider--vertical
+ */
 div {
     > .v-divider--vertical {
         display: inline;
@@ -20,63 +47,128 @@ div {
     }
 }
 
+/**
+ * Icon text alignment
+ * @class .v-icon.align-with-text
+ */
 .v-icon.align-with-text {
     vertical-align: text-bottom !important;
 }
 
+/**
+ * Feedback container styling
+ * @class #feedbackfin__container
+ */
 #feedbackfin__container {
     font-family: 'Roboto';
 }
 
+/* ==========================================================================
+   Interactive Elements
+   ========================================================================== */
+
+/**
+   Underlined links
+   @class .underlined
+ */
 a.underlined {
     text-decoration: underline !important;
 }
 
+/**
+   Rounded modal containers
+   @class .roundedModal
+ */
 .roundedModal {
     border-radius: 1.5rem;
 }
 
+/* ==========================================================================
+   Data Tables
+   ========================================================================== */
+
+/**
+   Data table responsive container
+   @class .v-data-table
+ */
 .v-data-table {
     overflow-x: auto;
 }
 
+/**
+   Data table wrapper overflow control
+   @class .v-data-table__wrapper
+ */
 .v-data-table__wrapper {
     overflow-x: auto !important;
 }
 
+/**
+   Data table minimum width and text wrapping
+   @class .v-data-table table
+ */
 .v-data-table table {
     min-width: 100%;
     white-space: nowrap;
 }
 
+/**
+   Raw input text truncation
+   @class .raw-input
+ */
 .raw-input {
     max-width: 71ch;
+    text-decoration: none;
     text-overflow: ellipsis;
     overflow: hidden;
     white-space: nowrap;
     list-style-type: none;
 }
 
+/**
+   Hide table count in footer
+   @class .hide-table-count .v-data-table-footer__info
+ */
 .hide-table-count .v-data-table-footer__info {
     display: none !important;
 }
 
+/* ==========================================================================
+   Theme Variables
+   ========================================================================== */
+
+/**
+   Custom CSS variables for theme
+   @namespace :root
+ */
 :root {
     --onboard-modal-backdrop: rgb(var(--v-theme-primary), 0.2);
     --onboard-modal-z-index: 10000;
 }
 
+/**
+   No decoration utility class
+   @class .no-decoration
+ */
 .no-decoration {
     text-decoration: none;
 }
 
-// Pagination button styles
+/* ==========================================================================
+   Pagination Component Styles
+   ========================================================================== */
+
+/**
+   Pagination container and button styling
+   @class .v-pagination
+ */
 .v-pagination {
   .v-btn {
     width: auto !important;
     padding-inline: 5px;
     min-width: 36px;
     border-color: rgb(var(--v-theme-primary), 0.25) !important;
+    
     &--rounded {
       border-radius: 50%;
     }
@@ -86,6 +178,7 @@ a.underlined {
     }
   }
 
+  /* Previous and next button sizing */
   &__prev,
   &__next {
     .v-btn {
@@ -94,9 +187,30 @@ a.underlined {
     }
   }
 
+  /* Active page button styling */
   &__item--is-active {
     .v-btn__overlay {
       opacity: var(--v-border-opacity);
     }
   }
+}
+
+/* ==========================================================================
+   Responsive Utilities
+   ========================================================================== */
+
+/**
+   Responsive container utilities
+ * @todo: Add responsive breakpoints and utility classes
+ */
+
+/* ==========================================================================
+   Print Styles
+   ========================================================================== */
+
+@media print {
+    /* Print-specific styles would go here */
+    .no-print {
+        display: none !important;
+    }
 }
