@@ -18,6 +18,8 @@ Ethernal is a comprehensive blockchain explorer and analytics platform that prov
 - **Code Editor**: Ace Editor with Solidity support
 - **Web3 Integration**: Web3.js, Ethers.js, Wagmi
 - **Wallet Support**: Web3-Onboard (MetaMask, WalletConnect, Coinbase, etc.)
+- **Performance**: Optimized bundle size and lazy loading
+- **Accessibility**: WCAG 2.1 compliant components
 
 ### Backend
 - **Runtime**: Node.js
