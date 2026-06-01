@@ -48,6 +48,13 @@ Ethernal is a comprehensive blockchain explorer and analytics platform that prov
 ### Advanced Analytics
 - **DEX Integration**: Uniswap V2/V3 pool analysis and token pricing
 - **Token Transfers**: Comprehensive ERC-20 transfer tracking
+
+### 🧠 Galaxy Brain Features
+- **AI-Powered Transaction Analysis**: Machine learning-based transaction pattern detection and risk assessment
+- **High-Performance Data Processing**: Parallel processing with Web Workers and intelligent caching for 10,000+ TPS
+- **Advanced Security Analysis**: Multi-layered threat detection with real-time intelligence and mitigation recommendations
+- **Real-time Analytics**: Interactive dashboards with live performance monitoring and predictive insights
+- **Enterprise-Grade Security**: Sophisticated algorithms for detecting reentrancy, front-running, and flash-loan attacks
 - **Internal Transactions**: Contract-to-contract interaction analysis
 - **Event Monitoring**: Custom event filtering and notifications
 - **Performance Metrics**: Transaction success rates and timing analysis
